@@ -655,9 +655,48 @@ def lan_block_rule_active(rule_name: str = "phone-harness block LAN") -> bool:  
     except (OSError, subprocess.TimeoutExpired):
         return False
     try:
-        return int(proc.stdout.strip()) > 0
+        if int(proc.stdout.strip()) > 0:
+            return True
     except ValueError:
+        pass
+    return _lan_block_rule_in_registry(rule_name)
+
+
+def _lan_block_rule_in_registry(rule_name: str) -> bool:
+    """The same answer for a non-admin user, where Get-NetFirewallRule is denied.
+
+    That cmdlet answers "Access is denied" without elevation, which counted as
+    zero rules and made the doctor call a locked machine exposed (2026-10-29,
+    Windows 10, standard user). The stored rule is readable by anyone, and its
+    Action/Active/Dir fields are not translated, unlike `netsh` output.
+    """
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules",
+        )
+    except (ImportError, OSError):
         return False
+    with key:
+        i = 0
+        while True:
+            try:
+                _, value, _ = winreg.EnumValue(key, i)
+            except OSError:
+                return False
+            i += 1
+            if not isinstance(value, str):
+                continue
+            fields = value.split("|")
+            if (
+                f"Name={rule_name}" in fields
+                and "Active=TRUE" in fields
+                and "Action=Block" in fields
+                and "Dir=In" in fields
+            ):
+                return True
 
 
 def start_forwards() -> None:  # noqa: vulture  (called from admin.py/viewer.py, outside this commit)
