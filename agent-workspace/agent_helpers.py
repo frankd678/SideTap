@@ -66,7 +66,14 @@ def _close_control_center(probe=None):
     # Raises when it stays open: a take replayed into the overlay would tap
     # Control Center tiles instead of the app.
     s = screen_info()
-    tap(s["width"] / 2, s["height"] * 0.93)
+    w, h = s["width"], s["height"]
+    tap(w / 2, h * 0.93)
+    if _wait_chain(probe or _RECORD_CHAIN, False):
+        return
+    # With enough tiles (Screen Mirroring added) the grid reaches the bottom and
+    # the tap lands on nothing that dismisses; an upward swipe from the bottom
+    # edge closes it either way.
+    swipe(w / 2, h - 2, w / 2, h * 0.4, 0.25)
     if not _wait_chain(probe or _RECORD_CHAIN, False):
         raise WDAError("Control Center did not close.")
 
