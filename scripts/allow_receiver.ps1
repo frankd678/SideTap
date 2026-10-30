@@ -1,9 +1,10 @@
-# Allow inbound connections for the AirPlay receiver only (ApowerMirror).
+# Allow inbound connections for the AirPlay receivers only (UxPlay, ApowerMirror).
 # Run from an elevated PowerShell. Undo with:  .\allow_receiver.ps1 -Remove
 param([switch]$Remove)
 
 $name = "phone-harness AirPlay receiver"
 $exes = @(
+    "C:\msys64\ucrt64\bin\uxplay.exe",
     "C:\Program Files (x86)\Apowersoft\ApowerMirror\ApowerMirror.exe",
     "C:\Program Files (x86)\Apowersoft\ApowerMirror\ApowerMirrorWiFi.exe"
 )

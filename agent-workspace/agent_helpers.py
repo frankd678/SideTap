@@ -38,10 +38,40 @@ _COUNTDOWN_SECONDS = 3.5
 _CC_TIMEOUT = 5.0
 
 
+def _on_screen_center(eid):
+    """Centre of the element if it is inside the screen, else None.
+
+    Control Center's buttons exist in the tree while it is still sliding in
+    (Screen Mirroring was found at y=-140 on 2026-10-30), so "found" is not "visible".
+    """
+    import math
+
+    if eid is None:
+        return None
+    try:
+        r = client()._session_request("GET", f"/element/{eid}/rect")
+    except WDAError:
+        return None
+    if not (
+        all(isinstance(r.get(k), (int, float)) and math.isfinite(r[k]) for k in ("x", "y", "width", "height"))
+        and r["width"] > 0 and r["height"] > 0
+    ):
+        return None
+    x, y = r["x"] + r["width"] / 2, r["y"] + r["height"] / 2
+    s = screen_info()
+    if not (0 < x < s["width"] and 0 < y < s["height"]):
+        return None
+    return x, y
+
+
+def _visible(chain):
+    return _on_screen_center(client().find_first(chain)) is not None
+
+
 def _wait_chain(chain, present, timeout=_CC_TIMEOUT):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if (client().find_first(chain) is not None) == present:
+        if _visible(chain) == present:
             return True
     return False
 
@@ -65,10 +95,16 @@ def _open_control_center(probe=None, label=None):
 def _close_control_center(probe=None):
     # Raises when it stays open: a take replayed into the overlay would tap
     # Control Center tiles instead of the app.
+    # Never tap blind: if Control Center is not visibly up, the bottom tap
+    # lands in whatever is underneath. On the Home Screen that is the Dock,
+    # and on 2026-10-30 it opened Messages.
+    probe = probe or _RECORD_CHAIN
+    if not _visible(probe):
+        return
     s = screen_info()
     w, h = s["width"], s["height"]
     tap(w / 2, h * 0.93)
-    if _wait_chain(probe or _RECORD_CHAIN, False):
+    if _wait_chain(probe, False):
         return
     # With enough tiles (Screen Mirroring added) the grid reaches the bottom and
     # the tap lands on nothing that dismisses; an upward swipe from the bottom
@@ -131,13 +167,7 @@ def _toggle_recording(want_on):
         eid, value = found
         if _recording_state(value) == want_on:
             raise WDAError(f"Screen recording is already {'on' if want_on else 'off'}.")
-        r = client()._session_request("GET", f"/element/{eid}/rect")
-        if not (
-            all(isinstance(r.get(k), (int, float)) and math.isfinite(r[k]) for k in ("x", "y", "width", "height"))
-            and r["width"] > 0 and r["height"] > 0
-        ):
-            raise WDAError(f"'{_RECORD_LABEL}' button has no usable rect: {r!r}.")
-        tap(r["x"] + r["width"] / 2, r["y"] + r["height"] / 2)
+        _tap_element(eid, f"'{_RECORD_LABEL}' button")
         if want_on:
             time.sleep(_COUNTDOWN_SECONDS)
         after = _record_button()
@@ -269,6 +299,7 @@ def dry_run_take(steps, path):
     import os
 
     _check_steps(steps, resolved=False)
+    app = client().active_app()["bundleId"]
     s = screen_info()
     w, h = s["width"], s["height"]
     saved = []
@@ -301,7 +332,7 @@ def dry_run_take(steps, path):
         if "expect" in step and not find_text(step["expect"], exact=True):
             raise WDAError(f"Step {i}: expected {step['expect']!r} on screen afterwards; stopping before saving.")
         saved.append(out)
-    take = {"version": _TAKE_VERSION, "screen": {"width": w, "height": h}, "steps": saved}
+    take = {"version": _TAKE_VERSION, "app": app, "screen": {"width": w, "height": h}, "steps": saved}
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(take, f, indent=2)
@@ -327,7 +358,25 @@ def _load_take(path):
             f"Take was rehearsed at {scr['width']}x{scr['height']} points, "
             f"the phone is at {now['width']}x{now['height']} (rotated?)."
         )
+    if not isinstance(take.get("app", _DEFAULT_TAKE_APP), str):
+        raise WDAError("Take has an invalid 'app'.")
     return take
+
+
+# Takes saved before the app was recorded were all rehearsed in Settings.
+_DEFAULT_TAKE_APP = "com.apple.Preferences"
+
+
+def _require_app(take):
+    """Refuse to replay unless the take's app is frontmost.
+
+    A take is blind coordinates: on 2026-10-30 a Settings take replayed on the
+    Home Screen tapped whatever icons sat under General and About.
+    """
+    want = take.get("app", _DEFAULT_TAKE_APP)
+    got = client().active_app().get("bundleId")
+    if got != want:
+        raise WDAError(f"Take expects {want!r} in front but {got!r} is; open it at the take's start screen first.")
 
 
 def replay_take(path, record=False):
@@ -335,6 +384,7 @@ def replay_take(path, record=False):
     from phone_harness import config
 
     take = _load_take(path)
+    _require_app(take)
     c = client()
     recording = False
     if record:
@@ -343,6 +393,8 @@ def replay_take(path, record=False):
     t0 = time.time()
     failure = None
     try:
+        # Control Center can leave something else in front; check again.
+        _require_app(take)
         c.set_wait_for_idle(0)
         for s in take["steps"]:
             if s["op"] == "tap":
@@ -477,15 +529,10 @@ def _receiver_chain(name):
 
 
 def _tap_element(eid, what):
-    import math
-
-    r = client()._session_request("GET", f"/element/{eid}/rect")
-    if not (
-        all(isinstance(r.get(k), (int, float)) and math.isfinite(r[k]) for k in ("x", "y", "width", "height"))
-        and r["width"] > 0 and r["height"] > 0
-    ):
-        raise WDAError(f"{what} has no usable rect: {r!r}.")
-    tap(r["x"] + r["width"] / 2, r["y"] + r["height"] / 2)
+    pt = _on_screen_center(eid)
+    if pt is None:
+        raise WDAError(f"{what} is not on screen; not tapping.")
+    tap(*pt)
 
 
 def _find_any(chains, timeout):
@@ -662,7 +709,7 @@ def start_capture(backend="uxplay", window_title=None, size="1320x2868", fps=60,
         if backend == "uxplay":
             if not os.path.exists(UXPLAY_EXE):
                 raise WDAError(f"UxPlay is not built yet ({UXPLAY_EXE} missing); see the AirPlay checklist.")
-            cmd = [UXPLAY_EXE, "-n", name, "-nh", "-s", size, "-fps", str(fps),
+            cmd = [UXPLAY_EXE, "-n", name, "-nh", "-h265", "-s", size, "-fps", str(fps),
                    "-mp4", os.path.join(work, "take"), "-vdmp", os.path.join(work, "videodump")]
             proc = subprocess.Popen(cmd, cwd=work, stdout=log, stderr=subprocess.STDOUT,
                                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
@@ -798,7 +845,7 @@ def replay_take_airplay(path, receiver=AIRPLAY_NAME, backend="uxplay", window_ti
     returned: a failure after the receiver was picked can leave the phone
     mirroring, and stop_mirroring() raising "not mirroring" is then harmless.
     """
-    _load_take(path)
+    _require_app(_load_take(path))
     handle = start_capture(backend, window_title, name=receiver)
     mirror_attempted, secs, final = False, None, None
     try:
