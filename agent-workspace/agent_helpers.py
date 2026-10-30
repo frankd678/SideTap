@@ -884,3 +884,98 @@ def replay_take_airplay(path, receiver=AIRPLAY_NAME, backend="uxplay", window_ti
             # mirror is what failed.
             final = _cleanup(stop_capture, handle)
     return final, secs
+
+
+# Clean-island capture over USB with qtmux (C:\CaptureRig\qtmux).
+#
+# qtmux owns the phone through the libusb-win32 driver and, in one process,
+# records Apple's QuickTime screen stream AND serves a usbmuxd socket that
+# go-ios uses (USBMUXD_SOCKET_ADDRESS=tcp://127.0.0.1:27115), so touches keep
+# working while it records. Unlike Screen Recording (red dot) and AirPlay (blue
+# pill), the QuickTime stream draws no Dynamic Island at all and shows the 09:41
+# capture status bar: 0 indicator pixels in 378 sampled frames on 2026-10-30.
+#
+# These helpers only talk to qtmux's loopback control API; they never start
+# qtmux or touch drivers. Before using them: phone on libusb0
+# (driver\set_iphone_driver.ps1 -Driver libusb0, UAC), qtmux.exe running, and
+# `phone-harness up` started with USBMUXD_SOCKET_ADDRESS set. Stop qtmux only
+# with POST /quit: a session cut off mid-stream wedges the phone's capture
+# service until the iPhone is restarted.
+
+QTMUX_CTL = "http://127.0.0.1:27116"
+_QT_TIMEOUT = 10.0
+_QT_STOP_TIMEOUT = 150.0  # stop waits for qtmux's ffmpeg remux (bounded at 2 min)
+
+
+def _qtmux(path, method="GET", timeout=_QT_TIMEOUT):
+    """JSON from qtmux's control API; its errors come back as WDAError."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(QTMUX_CTL + path, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.load(e).get("error") or e.reason
+        except ValueError:
+            msg = e.reason
+        raise WDAError(f"qtmux {path}: {msg}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise WDAError(
+            f"qtmux is not answering at {QTMUX_CTL} ({e}). Start C:\\CaptureRig\\qtmux\\qtmux.exe "
+            "with the phone on the libusb0 driver."
+        ) from None
+
+
+def qt_status():
+    """qtmux's live counters: video_frames, idr_frames, width, height, recording, mux_connections."""
+    return _qtmux("/status")
+
+
+def start_capture_qt(name=None):
+    """Start a clean-island recording in qtmux; returns the .flv path it writes.
+
+    Refuses unless video is already flowing (frames and a resolution reported):
+    a recording opened on a silent session would only fail at stop.
+    """
+    import urllib.parse
+
+    st = qt_status()
+    if not st.get("video_frames") or not st.get("width"):
+        raise WDAError(f"qtmux has no video yet ({st}); is the phone unlocked and qtmux past its PING?")
+    if st.get("recording"):
+        raise WDAError(f"qtmux is already recording to {st['recording']}")
+    q = "?name=" + urllib.parse.quote(name) if name else ""
+    return _qtmux("/record/start" + q, method="POST")["flv"]
+
+
+def stop_capture_qt():
+    """Stop the qtmux recording; returns the mp4 path after checking it plays."""
+    res = _qtmux("/record/stop", method="POST", timeout=_QT_STOP_TIMEOUT)
+    mp4 = res.get("mp4")
+    if not mp4:
+        raise WDAError(f"qtmux wrote no mp4: {res}")
+    secs, w, h, fps = _probe_video(mp4)
+    print(f"[qtmux] {mp4}: {secs:.1f}s {w}x{h} ~{fps:.0f}fps, {res.get('frames')} frames")
+    return mp4
+
+
+def replay_take_qt(path, name=None):
+    """Replay a take while qtmux records it; returns (mp4 path, take seconds).
+
+    The take's app must be in front before recording starts; the recording is
+    stopped in cleanup whenever it was started, without hiding the take's error.
+    """
+    _require_app(_load_take(path))
+    start_capture_qt(name)
+    secs = None
+    try:
+        time.sleep(0.5)  # recordings open on the next IDR frame (~0.6 s apart)
+        secs = replay_take(path, record=False)
+        time.sleep(0.5)
+    finally:
+        mp4 = _cleanup(stop_capture_qt)
+    return mp4, secs
