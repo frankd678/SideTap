@@ -457,7 +457,16 @@ def _receiver_chain(name):
     """Bounded chains for the receiver's row; which type iOS 27 uses is unverified."""
     if not name or any(ch in name for ch in '`"\\'):
         raise WDAError(f"Receiver name {name!r} must be plain text (no quotes or backslashes).")
-    return [f'**/XCUIElementType{t}[`label == "{name}"`]' for t in ("Button", "Cell", "StaticText")]
+    # WDA's class-chain parser chokes on [ ] inside a literal (ApowerMirror lists as
+    # "Apowersoft[HOSTNAME]"), so a bracketed name matches on the text before the bracket.
+    head = name.split("[")[0].strip()
+    if head != name:
+        if not head or "]" in head:
+            raise WDAError(f"Receiver name {name!r} has no usable text before '['.")
+        pred = f'label BEGINSWITH "{head}"'
+    else:
+        pred = f'label == "{name}"'
+    return [f'**/XCUIElementType{t}[`{pred}`]' for t in ("Button", "Cell", "StaticText")]
 
 
 def _tap_element(eid, what):
