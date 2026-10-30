@@ -103,15 +103,17 @@ def _close_control_center(probe=None):
         return
     s = screen_info()
     w, h = s["width"], s["height"]
-    tap(w / 2, h * 0.93)
-    if _wait_chain(probe, False):
-        return
-    # With enough tiles (Screen Mirroring added) the grid reaches the bottom and
-    # the tap lands on nothing that dismisses; an upward swipe from the bottom
-    # edge closes it either way.
-    swipe(w / 2, h - 2, w / 2, h * 0.4, 0.25)
-    if not _wait_chain(probe or _RECORD_CHAIN, False):
-        raise WDAError("Control Center did not close.")
+    # The mirroring sheet sits over Control Center, so one tap can close only
+    # the sheet; a second (gated again) closes Control Center. NEVER a swipe up
+    # from the bottom edge: that is the Home gesture, and on 2026-10-30 it took
+    # the phone out of the take's app twice.
+    for _ in range(2):
+        if not _visible(probe):
+            return
+        tap(w / 2, h * 0.93)
+        if _wait_chain(probe, False):
+            return
+    raise WDAError("Control Center did not close.")
 
 
 # A bounded class-chain lookup, never ui_tree(): a full Control Center /source
@@ -710,7 +712,9 @@ def start_capture(backend="uxplay", window_title=None, size="1320x2868", fps=60,
             if not os.path.exists(UXPLAY_EXE):
                 raise WDAError(f"UxPlay is not built yet ({UXPLAY_EXE} missing); see the AirPlay checklist.")
             cmd = [UXPLAY_EXE, "-n", name, "-nh", "-h265", "-s", size, "-fps", str(fps),
-                   "-mp4", os.path.join(work, "take"), "-vdmp", os.path.join(work, "videodump")]
+                   # Relative names: UxPlay runs in `work`, and on Windows it
+                   # drops the backslashes from an absolute -mp4 path.
+                   "-mp4", "take", "-vdmp", "videodump"]
             proc = subprocess.Popen(cmd, cwd=work, stdout=log, stderr=subprocess.STDOUT,
                                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         elif backend == "window":
@@ -782,7 +786,13 @@ def _remux_dump(work):
     if not dumps:
         return None
     out = os.path.join(work, "take.fromdump.mp4")
-    subprocess.run(["ffmpeg", "-hide_banner", "-y", "-fflags", "+genpts", "-r", "60", "-f", "h264",
+    # The dump is named .h264 whatever the codec; UxPlay logs the real one.
+    try:
+        with open(os.path.join(work, "uxplay.log"), encoding="utf-8", errors="replace") as f:
+            fmt = "hevc" if "codec is h265" in f.read() else "h264"
+    except OSError:
+        fmt = "h264"
+    subprocess.run(["ffmpeg", "-hide_banner", "-y", "-fflags", "+genpts", "-r", "60", "-f", fmt,
                     "-i", dumps[0], "-c", "copy", "-movflags", "+faststart", out],
                    capture_output=True, timeout=600)
     return out if os.path.exists(out) else None
@@ -806,6 +816,19 @@ def stop_capture(handle, dest=_TAKES_DIR):
                 proc.stdin.write(b"q")  # ffmpeg's own clean stop: finishes the mp4
                 proc.stdin.flush()
         else:
+            # UxPlay writes its mp4 only when the phone ends the session (Stop
+            # Mirroring); Ctrl-Break kills it before the file is closed, leaving
+            # 0 bytes (measured 2026-10-30). Give a just-stopped mirror up to 5s.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    with open(os.path.join(w, "uxplay.log"), encoding="utf-8", errors="replace") as f:
+                        if "Stopped recording" in f.read():
+                            break
+                except OSError:
+                    pass
+                time.sleep(0.25)
+
             def graceful():
                 proc.send_signal(signal.CTRL_BREAK_EVENT)
         code = _end_process(proc, graceful)
